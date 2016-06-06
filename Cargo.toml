@@ -12,6 +12,7 @@ dbtest = []
 [dependencies]
 toml = "*"
 postgis = "*"
+openssl = "*"
 protobuf = "*"
 nickel = "*"
 nickel_mustache = "*"
@@ -24,6 +25,7 @@ flate2 = "*"
 
 [dependencies.postgres]
 version = "*"
+features = ["openssl"]
 #Breaks Windows build
 #features = ["unix_socket"]
 

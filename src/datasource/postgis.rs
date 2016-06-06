@@ -8,6 +8,7 @@ use postgres::{Connection, SslMode};
 use postgres::rows::Row;
 use postgres::types::{Type, FromSql, ToSql, SessionInfo};
 use postgres;
+use openssl::ssl::{SslContext, SslMethod};
 use std::io::Read;
 use std;
 use core::feature::{Feature,FeatureAttr,FeatureAttrValType};
@@ -122,7 +123,8 @@ struct SqlQuery<'a> {
 impl PostgisInput {
     pub fn detect_layers(&self) -> Vec<Layer> {
         let mut layers: Vec<Layer> = Vec::new();
-        let conn = Connection::connect(&self.connection_url as &str, SslMode::None).unwrap();
+        let ctx = SslContext::new(SslMethod::Sslv23).unwrap();
+        let conn = Connection::connect(&self.connection_url as &str, SslMode::Prefer(&ctx)).unwrap();
         let stmt = conn.prepare("SELECT * FROM geometry_columns").unwrap();
         for row in &stmt.query(&[]).unwrap() {
             let table_name: String = row.get("f_table_name");
@@ -172,7 +174,8 @@ impl PostgisInput {
 impl DatasourceInput for PostgisInput {
     fn retrieve_features<F>(&self, layer: &Layer, extent: &Extent, zoom: u16, mut read: F)
         where F : FnMut(&Feature) {
-        let conn = Connection::connect(&self.connection_url as &str, SslMode::None).unwrap();
+        let ctx = SslContext::new(SslMethod::Sslv23).unwrap();
+        let conn = Connection::connect(&self.connection_url as &str, SslMode::Prefer(&ctx)).unwrap();
         let query = self.query(&layer, zoom);
         let stmt = conn.prepare(&query.sql).unwrap();
 
@@ -224,7 +227,10 @@ pub fn test_from_geom_fields() {
     use postgres;
 
     let conn: Connection = match env::var("DBCONN") {
-        Result::Ok(val) => Connection::connect(&val as &str, SslMode::None),
+        Result::Ok(val) => {
+            let ctx = SslContext::new(SslMethod::Sslv23).unwrap();
+            Connection::connect(&val as &str, SslMode::Prefer(&ctx))
+        },
         Result::Err(_) => { write!(&mut io::stdout(), "skipped ").unwrap(); return; }
     }.unwrap();
     let stmt = conn.prepare("SELECT wkb_geometry FROM ne_10m_populated_places LIMIT 1").unwrap();
