@@ -4,7 +4,7 @@
 //
 
 use core::layer::Layer;
-use core::feature::{Feature,FeatureStruct,FeatureAttr,FeatureAttrValType};
+use core::feature::{Feature,FeatureAttrValType};
 use core::grid::Extent;
 use core::geom::GeometryType;
 use core::geom;
@@ -117,9 +117,9 @@ impl ScreenGeom<geom::MultiPolygon> for screen::MultiPolygon {
 
 #[test]
 fn test_point_to_screen_coords() {
-    //let zh_mercator = geom::Point::new(949398.0, 6002729.0);
-    let zh_mercator = geom::Point::new(960000.0, 6002729.0);
-    //let zh_wgs84 = postgis::Point::<WGS84>::new(47.3703149, 8.5285874);
+    //let zh_mercator = geom::Point::new(949398.0, 6002729.0, Some(3857));
+    let zh_mercator = geom::Point::new(960000.0, 6002729.0, Some(3857));
+    //let zh_wgs84 = postgis::Point::new(47.3703149, 8.5285874, Some(4326));
     let tile_extent = Extent {minx: 958826.08, miny: 5987771.04, maxx: 978393.96, maxy: 6007338.92};
     let screen_pt = screen::Point::from_geom(&tile_extent, false, 4096, &zh_mercator);
     assert_eq!(screen_pt, screen::Point { x: 245, y: 3131 });
@@ -197,16 +197,22 @@ impl<'a> Tile<'a> {
             match attr.value {
                 FeatureAttrValType::String(ref v) => { mvt_value.set_string_value(v.clone()); }
                 FeatureAttrValType::Double(v) => { mvt_value.set_double_value(v); }
+                FeatureAttrValType::Float(v) => { mvt_value.set_float_value(v); }
                 FeatureAttrValType::Int(v) => { mvt_value.set_int_value(v); }
-                _ => { panic!("Feature attribute type not implemented yet") }
+                FeatureAttrValType::UInt(v) => { mvt_value.set_uint_value(v); }
+                FeatureAttrValType::SInt(v) => { mvt_value.set_sint_value(v); }
+                FeatureAttrValType::Bool(v) => { mvt_value.set_bool_value(v); }
             }
             Tile::add_feature_attribute(&mut mvt_layer, &mut mvt_feature,
                 attr.key.clone(), mvt_value);
         }
-        let geom = feature.geometry();
-        mvt_feature.set_field_type(geom.mvt_field_type());
-        mvt_feature.set_geometry(self.encode_geom(geom).vec());
-        mvt_layer.mut_features().push(mvt_feature);
+        if let Ok(geom) = feature.geometry() {
+            if !geom.is_empty() {
+                mvt_feature.set_field_type(geom.mvt_field_type());
+                mvt_feature.set_geometry(self.encode_geom(geom).vec());
+                mvt_layer.mut_features().push(mvt_feature);
+            }
+        }
     }
 
     pub fn add_layer(&mut self, mvt_layer: vector_tile::Tile_Layer) {
@@ -251,6 +257,9 @@ impl<'a> Tile<'a> {
         Self::write_to(&mut f, &self.mvt_tile);
     }
 }
+
+
+#[cfg(test)] use core::feature::{FeatureStruct,FeatureAttr};
 
 #[test]
 fn test_tile_values() {
@@ -492,7 +501,7 @@ fn test_build_mvt_with_helpers() {
     let layer = Layer::new("points");
     let mut mvt_layer = tile.new_layer(&layer);
 
-    let geom : GeometryType = GeometryType::Point(geom::Point::new(960000.0, 6002729.0));
+    let geom : GeometryType = GeometryType::Point(geom::Point::new(960000.0, 6002729.0, Some(3857)));
     let feature = FeatureStruct {
         fid: Some(1),
         attributes: vec![
@@ -504,7 +513,7 @@ fn test_build_mvt_with_helpers() {
     };
     tile.add_feature(&mut mvt_layer, &feature);
 
-    let geom : GeometryType = GeometryType::Point(geom::Point::new(960000.0, 6002729.0));
+    let geom : GeometryType = GeometryType::Point(geom::Point::new(960000.0, 6002729.0, Some(3857)));
     let feature = FeatureStruct {
         fid: Some(2),
         attributes: vec![

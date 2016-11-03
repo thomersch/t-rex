@@ -7,6 +7,7 @@ use core::Config;
 use toml;
 use rustc_serialize::Decodable;
 use std::collections::HashMap;
+use datasource::PostgisInput;
 
 
 #[derive(RustcDecodable, Debug)]
@@ -21,12 +22,18 @@ pub struct Layer {
     pub name: String,
     pub geometry_field: Option<String>,
     pub geometry_type: Option<String>,
+    /// Spatial reference system (PostGIS SRID)
+    pub srid: Option<i32>,
     pub fid_field: Option<String>,
     // Input for derived queries
     pub table_name: Option<String>,
     pub query_limit: Option<u32>,
     // Explicit queries
     pub query: Vec<LayerQuery>,
+    /// Simplify geometry (lines and polygons)
+    pub simplify: Option<bool>,
+    /// Tile buffer size in pixels
+    pub buffer_size: Option<u32>,
 }
 
 impl LayerQuery {
@@ -57,9 +64,9 @@ impl Layer {
         self.query.iter().map(|q| q.maxzoom()).max().unwrap_or(99)
     }
     // SQL query for zoom level
-    pub fn query(&self, level: u8) -> Option<&str> {
+    pub fn query(&self, level: u8) -> Option<&String> {
         let query = self.query.iter().find(|ref q| level >= q.minzoom() && level <= q.maxzoom());
-        query.and_then(|ref q| q.sql.as_ref().and_then(|sql| Some(sql.as_str())))
+        query.and_then(|ref q| q.sql.as_ref().and_then(|sql| Some(sql)))
     }
     /// Layer properties needed e.g. for metadata.json
     pub fn metadata(&self) -> HashMap<&str, String> {
@@ -73,6 +80,14 @@ impl Layer {
         metadata.insert("maxzoom", self.maxzoom().to_string());
         metadata.insert("srs", "+proj=merc +a=6378137 +b=6378137 +lat_ts=0.0 +lon_0=0.0 +x_0=0.0 +y_0=0.0 +k=1.0 +units=m +nadgrids=@null +wktext +no_defs +over".to_string());
         metadata
+    }
+    pub fn gen_runtime_config_from_input(&self, input: &PostgisInput) -> String {
+        let mut cfg = self.gen_runtime_config();
+        if self.query(0).is_none() {
+            let query = input.build_query_sql(self, 3857, None, true).unwrap();
+            cfg.push_str(&format!("#sql = \"\"\"{}\"\"\"\n", query))
+        }
+        cfg
     }
 }
 
@@ -94,6 +109,8 @@ table_name = "mytable"
 geometry_field = "wkb_geometry"
 geometry_type = "POINT"
 #fid_field = "id"
+#simplify = true
+#buffer-size = 10
 #[[tileset.layer.query]]
 #minzoom = 0
 #maxzoom = 22
@@ -122,6 +139,11 @@ geometry_type = "POINT"
                 => lines.push(format!("geometry_type = \"{}\"", geometry_type)),
             _   => lines.push("#geometry_type = \"POINT\"".to_string())
         }
+        match self.srid {
+            Some(ref srid)
+                => lines.push(format!("srid = {}", srid)),
+            _   => lines.push("#srid = 3857".to_string())
+        }
         match self.fid_field {
             Some(ref fid_field)
                 => lines.push(format!("fid_field = \"{}\"", fid_field)),
@@ -132,18 +154,23 @@ geometry_type = "POINT"
                 => lines.push(format!("query_limit = {}", query_limit)),
             _   => {}
         }
+        match self.buffer_size {
+            Some(ref buffer_size)
+                => lines.push(format!("buffer-size = {}", buffer_size)),
+            _   => lines.push(format!("#buffer-size = 10")),
+        }
+        match self.simplify {
+            Some(ref simplify)
+                => lines.push(format!("simplify = {}", simplify)),
+            _   => lines.push(format!("#simplify = true")),
+        }
         match self.query(0) {
             Some(ref query) => {
                 lines.push("[[tileset.layer.query]]".to_string());
                 lines.push(format!("sql = \"{}\"", query))
             },
             _   => {
-                let default_name = "mytable".to_string();
-                let ref table_name = self.table_name.as_ref().unwrap_or(&default_name);
-                let default_name = "wkb_geometry".to_string();
-                let ref geometry_field = self.geometry_field.as_ref().unwrap_or(&default_name);
                 lines.push("#[[tileset.layer.query]]".to_string());
-                lines.push(format!("#sql = \"SELECT name,{} FROM {}\"", geometry_field, table_name))
             }
         }
         lines.join("\n") + "\n"
@@ -201,8 +228,8 @@ fn test_toml_decode() {
     assert_eq!(cfg.minzoom(), 10);
     assert_eq!(cfg.maxzoom(), 14);
     assert_eq!(cfg.query(9), None);
-    assert_eq!(cfg.query(10), Some("SELECT name,wkb_geometry FROM places_z10"));
-    assert_eq!(cfg.query(14), Some("SELECT name,wkb_geometry FROM places_z10"));
+    assert_eq!(cfg.query(10), Some(&"SELECT name,wkb_geometry FROM places_z10".to_string()));
+    assert_eq!(cfg.query(14), Some(&"SELECT name,wkb_geometry FROM places_z10".to_string()));
     assert_eq!(cfg.query(15), None);
 
     // Minimal config
@@ -255,6 +282,7 @@ fn test_layers_from_config() {
         geometry_type = "POINT"
         fid_field = "id"
         query_limit = 100
+        buffer-size = 10
         [[tileset.layer.query]]
         sql = "SELECT name,wkb_geometry FROM ne_10m_populated_places"
 
@@ -269,6 +297,7 @@ fn test_layers_from_config() {
     assert_eq!(layers.len(), 2);
     assert_eq!(layers[0].name, "points");
     assert_eq!(layers[0].table_name, Some("ne_10m_populated_places".to_string()));
+    assert_eq!(layers[0].buffer_size, Some(10));
     assert_eq!(layers[1].table_name, None);
 
     // errors

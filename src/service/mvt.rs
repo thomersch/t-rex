@@ -5,14 +5,19 @@
 
 use datasource::{Datasource,DatasourceInput};
 use datasource::PostgisInput;
-use core::grid::Grid;
+use core::grid::{Grid, Extent, ExtentInt};
 use core::layer::Layer;
 use core::Config;
 use mvt::tile::Tile;
 use mvt::vector_tile;
-use cache::{Cache,Tilecache,Nocache};
+use cache::{Cache,Tilecache};
+use std::path::Path;
+use std::fs::{self,File};
+use std::io::Write;
 use toml;
-use rustc_serialize::json::{Json, ToJson};
+use rustc_serialize::json::{self, Json, ToJson};
+use pbr::ProgressBar;
+use std::io::Stdout;
 
 
 /// Collection of layers in one MVT
@@ -30,12 +35,56 @@ pub struct MvtService {
 }
 
 impl MvtService {
+    pub fn connect(&mut self) {
+        self.input = self.input.connected();
+    }
     fn get_tileset(&self, name: &str) -> Vec<&Layer> {
         let tileset = self.tilesets.iter().find(|t| t.name == name);
         match tileset {
             Some(set) => set.layers.iter().map(|l| l).collect(),
             None => Vec::new()
         }
+    }
+    /// Service metadata for backend web application
+    pub fn get_mvt_metadata(&self) -> Json {
+        #[derive(RustcEncodable)]
+        struct MvtInfo {
+            tilesets: Vec<TilesetInfo>,
+        }
+        #[derive(RustcEncodable)]
+        struct TilesetInfo {
+            name: String,
+            tilejson: String,
+            tileurl: String,
+            layers: Vec<LayerInfo>,
+            supported: bool,
+        }
+        #[derive(RustcEncodable)]
+        struct LayerInfo {
+            name: String,
+            geometry_type: Option<String>,
+        }
+
+        let mut tileset_infos: Vec<TilesetInfo> = self.tilesets.iter().map(|set| {
+            let layerinfos = set.layers.iter().map(|l| {
+                LayerInfo { name: l.name.clone(), geometry_type: l.geometry_type.clone() }
+                }).collect();
+            let supported = set.layers.iter().any(|l| {
+                let geom_type = l.geometry_type.clone().unwrap_or("UNKNOWN".to_string());
+                ["POINT","LINESTRING","POLYGON"].contains(&(&geom_type as &str))
+            });
+            TilesetInfo {
+                name: set.name.clone(),
+                tilejson: format!("{}.json", set.name),
+                tileurl: format!("/{}/{{z}}/{{x}}/{{y}}.pbf", set.name),
+                layers: layerinfos,
+                supported: supported,
+            }
+        }).collect();
+        tileset_infos.sort_by_key(|ti| ti.name.clone());
+        let mvt_info = MvtInfo { tilesets: tileset_infos };
+        let encoded = json::encode(&mvt_info).unwrap();
+        Json::from_str(&encoded).unwrap()
     }
     fn get_tilejson_infos(&self, tileset: &str) -> (Json, Json, Json) {
         let layers = self.get_tileset(tileset);
@@ -51,13 +100,14 @@ impl MvtService {
             "bounds": [-180.0,-90.0,180.0,90.0],
             "minzoom": 0,
             "maxzoom": 14,
-            "center": "0.0,0.0,2",
+            "center": [0.0, 0.0, 2],
             "basename": "{}"
         }}"#, tileset, tileset, tileset, tileset)).unwrap();
         let layers_metadata: Vec<(String,String)> = layers.iter().map(|layer| {
             let meta = layer.metadata();
-            let fields = self.input.detect_columns(&layer, 0);
-            let fields_json: Vec<String> = fields.iter().map(|f| format!("\"{}\": \"\"", f)).collect();
+            let query = layer.query(layer.maxzoom());
+            let fields = self.input.detect_data_columns(&layer, query);
+            let fields_json: Vec<String> = fields.iter().map(|&(ref f, _)| format!("\"{}\": \"\"", f)).collect();
             let layers = format!(r#"{{
                 "id": "{}",
                 "name": "{}",
@@ -92,15 +142,40 @@ impl MvtService {
         let vector_layers_json = Json::from_str(&format!("[{}]", vector_layers.join(","))).unwrap();
         (metadata, layers_json, vector_layers_json)
     }
-    pub fn get_tilejson(&self, tileset: &str) -> String {
+    /// TileJSON metadata (https://github.com/mapbox/tilejson-spec)
+    pub fn get_tilejson(&self, baseurl: &str, tileset: &str) -> String {
         let (mut metadata, _layers, vector_layers) = self.get_tilejson_infos(tileset);
         let mut obj = metadata.as_object_mut().unwrap();
-        let url = Json::from_str(&format!("[\"http://127.0.0.1:6767/{}/{{z}}/{{x}}/{{y}}.pbf\"]", tileset)).unwrap();
+        let url = Json::from_str(&format!("[\"{}/{}/{{z}}/{{x}}/{{y}}.pbf\"]", baseurl, tileset)).unwrap();
         obj.insert("tiles".to_string(), url);
         obj.insert("vector_layers".to_string(), vector_layers);
         obj.to_json().to_string()
     }
-    pub fn get_metadata(&self, tileset: &str) -> String {
+    /// MapboxGL Style JSON (https://www.mapbox.com/mapbox-gl-style-spec/)
+    pub fn get_stylejson(&self, baseurl: &str, tileset: &str) -> String {
+        let json = Json::from_str(&format!(r#"
+        {{
+            "version": 8,
+            "name": "t-rex",
+            "sources": {{
+                "{}": {{
+                    "url": "{}/{}.json",
+                    "type": "vector"
+                }}
+            }},
+            "layers": [
+                {{
+                    "id": "{}",
+                    "type": "line",
+                    "source": "{}",
+                    "source-layer": "{}"
+                }}
+            ]
+        }}"#, tileset, baseurl, tileset, tileset, tileset, tileset)).unwrap();
+        json.to_string()
+    }
+    /// MBTiles metadata.json
+    pub fn get_mbtiles_metadata(&self, tileset: &str) -> String {
         let (mut metadata, layers, vector_layers) = self.get_tilejson_infos(tileset);
         let json_str = format!(r#"
         {{
@@ -112,14 +187,26 @@ impl MvtService {
         obj.insert("json".to_string(), metadata_vector_layers.to_string().to_json());
         obj.to_json().to_string()
     }
+    /// Prepare datasource queries. Must be called before requesting tiles.
+    pub fn prepare_feature_queries(&mut self) {
+        for tileset in &self.tilesets {
+            for layer in &tileset.layers {
+                self.input.prepare_queries(&layer, self.grid.srid);
+            }
+        }
+    }
     /// Create vector tile from input at x, y, z
     pub fn tile(&self, tileset: &str, xtile: u16, ytile: u16, zoom: u8) -> vector_tile::Tile {
-        let extent = self.grid.tile_extent_reverse_y(xtile, ytile, zoom);
+        let extent = if self.grid.srid == 3857 {
+            self.grid.tile_extent_reverse_y(xtile, ytile, zoom)
+        } else {
+            self.grid.tile_extent(xtile, ytile, zoom)
+        };
         debug!("MVT tile request {:?}", extent);
         let mut tile = Tile::new(&extent, 4096, true);
         for layer in self.get_tileset(tileset) {
             let mut mvt_layer = tile.new_layer(layer);
-            self.input.retrieve_features(&layer, &extent, zoom, |feat| {
+            self.input.retrieve_features(&layer, &extent, zoom, &self.grid, |feat| {
                 tile.add_feature(&mut mvt_layer, feat);
             });
             tile.add_layer(mvt_layer);
@@ -127,7 +214,7 @@ impl MvtService {
         tile.mvt_tile
     }
     /// Fetch or create vector tile from input at x, y, z
-    pub fn tile_cached(&self, tileset: &str, xtile: u16, ytile: u16, zoom: u8, gzip: bool) -> Vec<u8> {
+    pub fn tile_cached(&self, tileset: &str, xtile: u16, ytile: u16, zoom: u8, _gzip: bool) -> Vec<u8> {
         let path = format!("{}/{}/{}/{}.pbf", tileset, zoom, xtile, ytile);
 
         let mut tile: Option<Vec<u8>> = None;
@@ -150,6 +237,67 @@ impl MvtService {
         //TODO: return unzipped if gzip == false
         tilegz
     }
+    fn progress_bar(&self, msg: &str, limits: &ExtentInt) -> ProgressBar<Stdout> {
+        let tiles = (limits.maxx as u64-limits.minx as u64)*(limits.maxy as u64-limits.miny as u64);
+        let mut pb = ProgressBar::new(tiles);
+        pb.message(msg);
+        //pb.set_max_refresh_rate(Some(Duration::from_millis(200)));
+        pb.show_speed = false;
+        pb.show_percent = false;
+        pb.show_time_left = false;
+        pb
+    }
+    /// Populate tile cache
+    pub fn generate(&self, tileset_name: Option<&str>, minzoom: Option<u8>, maxzoom: Option<u8>,
+                    extent: Option<Extent>, nodes: Option<u8>, nodeno: Option<u8>, progress: bool) {
+        self.init_cache();
+        let minzoom = minzoom.unwrap_or(0);
+        let maxzoom = maxzoom.unwrap_or(self.grid.nlevels());
+        let extent = extent.unwrap_or(self.grid.tile_extent(0, 0, 0));
+        let nodes = nodes.unwrap_or(1) as u64;
+        let nodeno = nodeno.unwrap_or(0) as u64;
+        let mut tileno: u64 = 0;
+        let limits = self.grid.tile_limits(extent, 0);
+        for tileset in &self.tilesets {
+            if tileset_name.is_some() &&
+               tileset_name.unwrap() != &tileset.name {
+                continue;
+            }
+            if progress { println!("Generating tileset '{}'...", tileset.name); }
+            for zoom in minzoom..maxzoom {
+                let ref limit = limits[zoom as usize];
+                let mut pb = self.progress_bar(&format!("Level {}: ", zoom), &limit);
+                if progress { pb.tick(); }
+                for xtile in limit.minx..limit.maxx {
+                    for ytile in limit.miny..limit.maxy {
+                        let skip = tileno % nodes != nodeno;
+                        tileno += 1;
+                        if skip { continue; }
+
+                        let mvt_tile = self.tile(&tileset.name, xtile, ytile, zoom);
+                        let mut tilegz = Vec::new();
+                        Tile::write_gz_to(&mut tilegz, &mvt_tile);
+                        let path = format!("{}/{}/{}/{}.pbf", &tileset.name, zoom, xtile, ytile);
+                        let _ = self.cache.write(&path, &tilegz);
+                        if progress { pb.inc(); }
+                    }
+                }
+            }
+        }
+        if progress { println!(""); }
+    }
+    pub fn init_cache(&self) {
+        if let Tilecache::Filecache(ref fc) = self.cache {
+            info!("Tile cache directory: {}", fc.basepath);
+            // Write metadata.json for each tileset
+            for tileset in &self.tilesets {
+                let path = Path::new(&fc.basepath).join(&tileset.name);
+                fs::create_dir_all(&path).unwrap();
+                let mut f = File::create(&path.join("metadata.json")).unwrap();
+                let _ = f.write_all(self.get_mbtiles_metadata(&tileset.name).as_bytes());
+            }
+        }
+    }
 }
 
 
@@ -161,6 +309,13 @@ impl Tileset {
               .and_then(|tilesets| {
                   Ok(tilesets.iter().map(|tileset| Tileset::from_config(tileset).unwrap()).collect())
               })
+    }
+    pub fn gen_runtime_config_from_input(&self, input: &PostgisInput) -> String {
+        let mut config = String::new();
+        for layer in &self.layers {
+            config.push_str(&layer.gen_runtime_config_from_input(input));
+        }
+        config
     }
 }
 
@@ -213,7 +368,7 @@ impl Config<MvtService> for MvtService {
         config.push_str(&self.input.gen_runtime_config());
         config.push_str(&self.grid.gen_runtime_config());
         for tileset in &self.tilesets {
-            config.push_str(&tileset.gen_runtime_config());
+            config.push_str(&tileset.gen_runtime_config_from_input(&self.input));
         }
         config.push_str(&self.cache.gen_runtime_config());
         config
@@ -223,19 +378,21 @@ impl Config<MvtService> for MvtService {
 
 const TOML_SERVICES: &'static str = r#"# t-rex configuration
 
-[services]
-mvt = true
+[service.mvt]
+viewer = true
 "#;
 
 
+#[cfg(test)] use cache::Nocache;
+
 #[test]
+#[ignore]
 pub fn test_tile_query() {
-    use std::io::{self,Write};
     use std::env;
 
     let pg: PostgisInput = match env::var("DBCONN") {
-        Result::Ok(val) => Some(PostgisInput {connection_url: val}),
-        Result::Err(_) => { write!(&mut io::stdout(), "skipped ").unwrap(); return; }
+        Result::Ok(val) => Some(PostgisInput::new(&val).connected()),
+        Result::Err(_) => { panic!("DBCONN undefined") }
     }.unwrap();
     let grid = Grid::web_mercator();
     let mut layer = Layer::new("points");
@@ -244,8 +401,9 @@ pub fn test_tile_query() {
     layer.geometry_type = Some(String::from("POINT"));
     layer.query_limit = Some(1);
     let tileset = Tileset{name: "points".to_string(), layers: vec![layer]};
-    let service = MvtService {input: pg, grid: grid,
+    let mut service = MvtService {input: pg, grid: grid,
                               tilesets: vec![tileset], cache: Tilecache::Nocache(Nocache)};
+    service.prepare_feature_queries();
 
     let mvt_tile = service.tile("points", 33, 22, 6);
     println!("{:#?}", mvt_tile);
@@ -259,7 +417,16 @@ pub fn test_tile_query() {
             features: [
                 Tile_Feature {
                     id: None,
-                    tags: [],
+                    tags: [
+                        0,
+                        0,
+                        1,
+                        1,
+                        2,
+                        2,
+                        3,
+                        3
+                    ],
                     field_type: Some(
                         POINT
                     ),
@@ -276,8 +443,80 @@ pub fn test_tile_query() {
                     }
                 }
             ],
-            keys: [],
-            values: [],
+            keys: [
+                "fid",
+                "scalerank",
+                "name",
+                "pop_max"
+            ],
+            values: [
+                Tile_Value {
+                    string_value: None,
+                    float_value: None,
+                    double_value: None,
+                    int_value: Some(
+                        106
+                    ),
+                    uint_value: None,
+                    sint_value: None,
+                    bool_value: None,
+                    unknown_fields: UnknownFields {
+                        fields: None
+                    },
+                    cached_size: Cell {
+                        value: 0
+                    }
+                },
+                Tile_Value {
+                    string_value: None,
+                    float_value: None,
+                    double_value: Some(
+                        10
+                    ),
+                    int_value: None,
+                    uint_value: None,
+                    sint_value: None,
+                    bool_value: None,
+                    unknown_fields: UnknownFields {
+                        fields: None
+                    },
+                    cached_size: Cell {
+                        value: 0
+                    }
+                },
+                Tile_Value {
+                    string_value: Some("Delemont"),
+                    float_value: None,
+                    double_value: None,
+                    int_value: None,
+                    uint_value: None,
+                    sint_value: None,
+                    bool_value: None,
+                    unknown_fields: UnknownFields {
+                        fields: None
+                    },
+                    cached_size: Cell {
+                        value: 0
+                    }
+                },
+                Tile_Value {
+                    string_value: None,
+                    float_value: None,
+                    double_value: Some(
+                        11315
+                    ),
+                    int_value: None,
+                    uint_value: None,
+                    sint_value: None,
+                    bool_value: None,
+                    unknown_fields: UnknownFields {
+                        fields: None
+                    },
+                    cached_size: Cell {
+                        value: 0
+                    }
+                }
+            ],
             extent: Some(
                 4096
             ),
@@ -300,37 +539,261 @@ pub fn test_tile_query() {
 }
 
 #[test]
-pub fn test_metadata() {
+pub fn test_mvt_metadata() {
     use core::read_config;
-    use std::io::{self,Write};
-    use std::env;
-
-    if env::var("DBCONN").is_err() {
-        write!(&mut io::stdout(), "skipped ").unwrap();
-        return;
-    }
 
     let config = read_config("src/test/example.cfg").unwrap();
     let service = MvtService::from_config(&config).unwrap();
-    let metadata = service.get_metadata("points");
+
+    let metadata = format!("{}", service.get_mvt_metadata().pretty());
+    let expected = r#"{
+  "tilesets": [
+    {
+      "layers": [
+        {
+          "geometry_type": "POINT",
+          "name": "points"
+        },
+        {
+          "geometry_type": "POLYGON",
+          "name": "buildings"
+        }
+      ],
+      "name": "osm",
+      "supported": true,
+      "tilejson": "osm.json",
+      "tileurl": "/osm/{z}/{x}/{y}.pbf"
+    }
+  ]
+}"#;
     println!("{}", metadata);
-    let format = r#""format":"pbf""#;
-    assert!(metadata.contains(format));
-    let jsonmeta = r#"\"vector_layers\":"#;
-    assert!(metadata.contains(jsonmeta));
+    assert_eq!(metadata, expected);
+}
+
+#[test]
+#[ignore]
+pub fn test_tilejson() {
+    use core::read_config;
+    use std::env;
+
+    if env::var("DBCONN").is_err() {
+        panic!("DBCONN undefined");
+    }
+
+    let config = read_config("src/test/example.cfg").unwrap();
+    let mut service = MvtService::from_config(&config).unwrap();
+    service.connect();
+    service.prepare_feature_queries();
+
+    let metadata = service.get_tilejson("http://127.0.0.1", "osm");
+    let metadata = Json::from_str(&metadata).unwrap().pretty().to_string();
+    println!("{}", metadata);
+    let expected = r#"{
+  "attribution": "",
+  "basename": "osm",
+  "bounds": [
+    -180.0,
+    -90.0,
+    180.0,
+    90.0
+  ],
+  "center": [
+    0.0,
+    0.0,
+    2
+  ],
+  "description": "osm",
+  "format": "pbf",
+  "id": "osm",
+  "maxzoom": 14,
+  "minzoom": 0,
+  "name": "osm",
+  "scheme": "xyz",
+  "tiles": [
+    "http://127.0.0.1/osm/{z}/{x}/{y}.pbf"
+  ],
+  "vector_layers": [
+    {
+      "description": "",
+      "fields": {
+        "fid": "",
+        "name": "",
+        "pop_max": "",
+        "scalerank": ""
+      },
+      "id": "points",
+      "maxzoom": 99,
+      "minzoom": 0
+    },
+    {
+      "description": "",
+      "fields": {},
+      "id": "buildings",
+      "maxzoom": 99,
+      "minzoom": 0
+    }
+  ],
+  "version": "2.0.0"
+}"#;
+    assert_eq!(metadata, expected);
+}
+
+#[test]
+pub fn test_stylejson() {
+    use core::read_config;
+
+    let config = read_config("src/test/example.cfg").unwrap();
+    let service = MvtService::from_config(&config).unwrap();
+    let json = service.get_stylejson("http://127.0.0.1", "osm");
+    let json = Json::from_str(&json).unwrap().pretty().to_string();
+    println!("{}", json);
+    let expected= r#"{
+  "layers": [
+    {
+      "id": "osm",
+      "source": "osm",
+      "source-layer": "osm",
+      "type": "line"
+    }
+  ],
+  "name": "t-rex",
+  "sources": {
+    "osm": {
+      "type": "vector",
+      "url": "http://127.0.0.1/osm.json"
+    }
+  },
+  "version": 8
+}"#;
+    assert_eq!(json, expected);
+
+    // Mapbox GL style experiments
+    let configjson = json::encode(&config.lookup("tileset.0.layer.1.style").unwrap()).unwrap().replace("}{", "},{").replace("][", "],[");
+    let configjson = Json::from_str(&configjson).unwrap().pretty().to_string();
+    println!("{}", configjson);
+    let expected= r##"[
+  {
+    "fill-color": {
+      "stops": [
+        {
+          "in": 15.5,
+          "out": "#f2eae2"
+        },
+        {
+          "in": 16,
+          "out": "#dfdbd7"
+        }
+      ]
+    },
+    "interactive": true,
+    "type": "fill"
+  },
+  {
+    "circle-color": [
+      {
+        "property": "temperature",
+        "stops": [
+          {
+            "in": 0,
+            "out": "blue"
+          },
+          {
+            "in": 100,
+            "out": "red"
+          }
+        ]
+      }
+    ],
+    "fill-color": "#f2eae2",
+    "fill-outline-color": "#dfdbd7",
+    "fill-translate": {
+      "stops": [
+        {
+          "in": 15,
+          "out": [
+            11
+          ]
+        },
+        {
+          "in": 16,
+          "out": [
+            -20
+          ]
+        }
+      ]
+    },
+    "fillopacity": {
+      "base": 1,
+      "stops": [
+        [
+          150
+        ],
+        [
+          161
+        ]
+      ]
+    },
+    "interactive": true,
+    "type": "fill"
+  }
+]"##;
+    assert_eq!(configjson, expected);
+}
+
+#[test]
+#[ignore]
+pub fn test_mbtiles_metadata() {
+    use core::read_config;
+    use std::env;
+
+    if env::var("DBCONN").is_err() {
+        panic!("DBCONN undefined");
+    }
+
+    let config = read_config("src/test/example.cfg").unwrap();
+    let mut service = MvtService::from_config(&config).unwrap();
+    service.connect();
+    let metadata = service.get_mbtiles_metadata("osm");
+    let metadata = Json::from_str(&metadata).unwrap().pretty().to_string();
+    println!("{}", metadata);
+    let expected = r#"{
+  "attribution": "",
+  "basename": "osm",
+  "bounds": [
+    -180.0,
+    -90.0,
+    180.0,
+    90.0
+  ],
+  "center": [
+    0.0,
+    0.0,
+    2
+  ],
+  "description": "osm",
+  "format": "pbf",
+  "id": "osm",
+  "json": "{\"Layer\":[{\"description\":\"\",\"fields\":{\"fid\":\"\",\"name\":\"\",\"pop_max\":\"\",\"scalerank\":\"\"},\"id\":\"points\",\"name\":\"points\",\"properties\":{\"buffer-size\":0,\"maxzoom\":99,\"minzoom\":0},\"srs\":\"+proj=merc +a=6378137 +b=6378137 +lat_ts=0.0 +lon_0=0.0 +x_0=0.0 +y_0=0.0 +k=1.0 +units=m +nadgrids=@null +wktext +no_defs +over\"},{\"description\":\"\",\"fields\":{},\"id\":\"buildings\",\"name\":\"buildings\",\"properties\":{\"buffer-size\":0,\"maxzoom\":99,\"minzoom\":0},\"srs\":\"+proj=merc +a=6378137 +b=6378137 +lat_ts=0.0 +lon_0=0.0 +x_0=0.0 +y_0=0.0 +k=1.0 +units=m +nadgrids=@null +wktext +no_defs +over\"}],\"vector_layers\":[{\"description\":\"\",\"fields\":{\"fid\":\"\",\"name\":\"\",\"pop_max\":\"\",\"scalerank\":\"\"},\"id\":\"points\",\"maxzoom\":99,\"minzoom\":0},{\"description\":\"\",\"fields\":{},\"id\":\"buildings\",\"maxzoom\":99,\"minzoom\":0}]}",
+  "maxzoom": 14,
+  "minzoom": 0,
+  "name": "osm",
+  "scheme": "xyz",
+  "version": "2.0.0"
+}"#;
+    assert_eq!(metadata, expected);
 }
 
 #[test]
 pub fn test_gen_config() {
     let expected = r#"# t-rex configuration
 
-[services]
-mvt = true
+[service.mvt]
+viewer = true
 
 [datasource]
 type = "postgis"
 # Connection specification (https://github.com/sfackler/rust-postgres#connecting)
-url = "postgresql://user:pass@host:port/database"
+url = "postgresql://user:pass@host/database"
 
 [grid]
 # Predefined grids: web_mercator, wgs84
@@ -345,6 +808,8 @@ table_name = "mytable"
 geometry_field = "wkb_geometry"
 geometry_type = "POINT"
 #fid_field = "id"
+#simplify = true
+#buffer-size = 10
 #[[tileset.layer.query]]
 #minzoom = 0
 #maxzoom = 22

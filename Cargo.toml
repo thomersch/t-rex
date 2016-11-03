@@ -1,6 +1,6 @@
 [package]
 name = "t-rex"
-version = "0.0.0"
+version = "0.5.0"
 authors = ["Pirmin Kalberer <pka@sourcepole.ch>"]
 
 [[bin]]
@@ -11,16 +11,19 @@ dbtest = []
 
 [dependencies]
 toml = "*"
-postgis = "*"
+r2d2 = "*"
+r2d2_postgres = "*"
+postgis = { git = "https://github.com/pka/rust-postgis.git", branch = "rust-geo" }
 protobuf = "*"
 nickel = "*"
 mustache = "0.6.3" # Same version as nickel
 rustc-serialize = "*"
-clap = "*"
+clap = "~2.10.0" # Compile error in 2.11.3
 log = "*"
 env_logger = "*"
 time = "*"
 flate2 = "*"
+pbr = "*"
 
 [dependencies.postgres]
 version = "*"
